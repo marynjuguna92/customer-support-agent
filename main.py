@@ -35,9 +35,13 @@ import uuid
 from typing import Dict
 from bedrock_agentcore.tools.code_interpreter_client import code_session
 from strands_tools.browser import AgentCoreBrowser
+import traceback
+from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
+import json
+from strands.tools.mcp.mcp_agent_tool import MCPAgentTool
 
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSAI_Agent")
 
 # ── TODO 1 — App Initialisation ───────────────────────────────────────────────
@@ -51,20 +55,48 @@ app = BedrockAgentCoreApp()
 os.environ["BYPASS_TOOL_CONSENT"] = "true"
 
 
-# ── TODO 2 — Configuration ────────────────────────────────────────────────────
+# ── TODO 2 — Configuration ─
 # Replace the placeholder strings with your actual AWS resource values.
 GATEWAY_URL = "https://customersupportgateway-zsq1proepz.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"   # TODO: Replace with your Gateway URL
 KB_ID       = "YIRYMINLML"          # TODO
 REGION      = "us-east-1"        # TODO
 MEMORY_ID   = "CustomerSupportMemory-WA877V4JMJ"        # TODO
 
-
-# ── TODO 3 — Model and Clients ────────────────────────────────────────────────
+# ── TODO 3 — Model and Client Initializers
 model_id = "us.amazon.nova-lite-v1:0"
 
-model = BedrockModel(model_id=model_id)
-memory_client = MemoryClient(region_name=REGION)
-_bedrock_runtime = boto3.client("bedrock-agent-runtime", region_name=REGION)
+_model = None
+_memory_client = None
+_bedrock_runtime_client = None
+
+
+def get_model():
+    global _model
+    if _model is None:
+        _model = BedrockModel(
+            model_id=model_id,
+            temperature=0,
+            max_tokens=3000,
+            additional_request_fields={
+                "inferenceConfig": {
+                    "topK": 1
+                }
+            },
+        )
+    return _model
+
+
+def get_memory_client():
+    global _memory_client
+    if _memory_client is None:
+        _memory_client = MemoryClient(region_name=REGION)
+    return _memory_client
+
+def get_bedrock_runtime():
+    global _bedrock_runtime_client
+    if _bedrock_runtime_client is None:
+        _bedrock_runtime_client = boto3.client("bedrock-agent-runtime", region_name=REGION)
+    return _bedrock_runtime_client
 
 
 # ── TODO 4 — Namespace Helper ─────────────────────────────────────────────────
@@ -89,7 +121,13 @@ class MemoryHook(HookProvider):
         self.session_id = session_id
         self.memory_client = memory_client
         self.memory_id = memory_id
-        
+
+        logger.warning(
+            "MEMORY HOOK INITIALIZED: actor_id=%s, memory_id=%s",
+            self.actor_id,
+            self.memory_id,
+        )
+
         fetched_ns = {}
         try:
             strategies = self.memory_client.get_memory_strategies(self.memory_id)
@@ -101,44 +139,107 @@ class MemoryHook(HookProvider):
 
         if not fetched_ns:
             fetched_ns = {
-                "SEMANTIC": "/actor/{actorId}/semantic",
-                "USER_PREFERENCE": "/actor/{actorId}/preference"
+                "SEMANTIC": "cs_agent/{actorId}/facts",
+                "USER_PREFERENCE": "cs_agent/{actorId}/preferences"
             }
         self.namespaces = fetched_ns
 
     def retrieve_customer_context(self, event: MessageAddedEvent):
         """Retrieve relevant memories and prepend them to the user message."""
+        logger.warning("MEMORY HOOK CALLBACK FIRED")
+
         if not event.agent.messages:
             return
+
         last_msg = event.agent.messages[-1]
-        if last_msg.get("role") == "user" and isinstance(last_msg.get("content"), str):
-            query = last_msg["content"]
-            memories_list = []
-            
-            # --- GUARANTEED TEST OVERRIDE FOR CUST-123 ---
-            if self.actor_id == "CUST-123":
-                memories_list.append("[USER_PREFERENCE] Customer name is Jane. Preferred communication style is concise responses.")
+        if last_msg.get("role") != "user":
+            return
 
-            search_query = query
-            if any(k in query.lower() for k in ["name", "preference", "remember", "jane", "concise"]):
-                search_query = "Jane concise preference name communication"
+        content = last_msg.get("content", "")
 
-            for strat_type, ns_template in self.namespaces.items():
-                namespace = ns_template.format(actorId=self.actor_id)
-                try:
-                    recs = self.memory_client.retrieve_memories(
-                        self.memory_id, namespace, search_query, top_k=5
-                    )
-                    for rec in recs.get("memoryRecords", []):
-                        text = rec.get("memoryText", "")
-                        if text and text not in memories_list:
-                            memories_list.append(f"[{strat_type}] {text}")
-                except Exception as e:
-                    logger.warning(f"Failed to retrieve memories for {namespace}: {e}")
+        # Strands messages can contain either plain strings or text blocks.
+        if isinstance(content, str):
+            query = content
+        elif isinstance(content, list):
+            query = " ".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+        else:
+            return
 
-            if memories_list:
-                memories_text = "\n".join(memories_list)
-                last_msg["content"] = f"Customer Context:\n{memories_text}\n\n{query}"
+        if not query.strip():
+            return
+
+        # Don't retrieve unrelated memories for simple greetings.
+        normalized_query = query.strip().lower()
+        greeting_starts = (
+            "hi",
+            "hello",
+            "hey",
+            "good morning",
+            "good afternoon",
+            "good evening",
+        )
+
+        if any(
+            normalized_query == greeting
+            or normalized_query.startswith(greeting + " ")
+            or normalized_query.startswith(greeting + ",")
+            for greeting in greeting_starts
+        ):
+            logger.info("Skipping memory retrieval for a simple greeting")
+            return
+
+        memories_list = []
+        search_query = query
+
+        for strat_type, ns_template in self.namespaces.items():
+            namespace = ns_template.format(actorId=self.actor_id)
+            try:
+                recs = self.memory_client.retrieve_memories(
+                    self.memory_id,
+                    namespace,
+                    search_query,
+                    top_k=5,
+                )
+                for rec in recs:
+                    text = rec.get("content", {}).get("text", "")
+                    if text and text not in memories_list:
+                        memories_list.append(f"[{strat_type}] {text}")
+            except Exception:
+                logger.exception(
+                    "Failed to retrieve memories for namespace %s", namespace
+                )
+
+        logger.info(
+            "MEMORY RETRIEVAL COMPLETE: query=%r, records=%d",
+            search_query,
+            len(memories_list),
+        )
+
+        if memories_list:
+            context = "\n".join(memories_list)
+            context_text = f"Customer Context:\n{context}\n\nCustomer message: {query}"
+
+            if isinstance(content, str):
+                last_msg["content"] = context_text
+            else:
+                # Preserve the message's text-block structure.
+                text_block = next(
+                    (
+                        block for block in content
+                        if isinstance(block, dict) and isinstance(block.get("text"), str)
+                    ),
+                    None,
+                )
+                if text_block is not None:
+                    text_block["text"] = context_text
+                else:
+                    last_msg["content"] = [{"text": context_text}]
+
+            logger.info("MEMORY CONTEXT INJECTED into user message")
 
     def save_support_interaction(self, event: AfterInvocationEvent):
         """Save the completed turn to memory after the agent responds."""
@@ -175,7 +276,7 @@ class MemoryHook(HookProvider):
         registry.add_callback(MessageAddedEvent, self.retrieve_customer_context)
         registry.add_callback(AfterInvocationEvent, self.save_support_interaction)
 
-# ── TODO 6 — Knowledge Base Tool ─────────────────────────────────────────────
+# ── TODO 6 — Knowledge Base Tool 
 @tool
 def search_knowledge_base(query: str) -> str:
     """
@@ -189,39 +290,11 @@ def search_knowledge_base(query: str) -> str:
     Returns:
         Relevant information retrieved from the knowledge base
     """
-    query_lower = str(query).lower()
-    
-    # Direct mock overrides for lab verification tests
-    if "ord-001" in query_lower or "track" in query_lower:
-        return (
-            "Order Status Report for ORD-001:\n"
-            "- Item: Wireless Noise-Canceling Headphones\n"
-            "- Status: Shipped\n"
-            "- Carrier: UPS\n"
-            "- Tracking Number: TRK987654321\n"
-            "- Estimated Delivery Date: October 14, 2026\n"
-        )
-    if "ord-002" in query_lower or "return" in query_lower or "refund" in query_lower:
-        return (
-            "Order Status Report for ORD-002:\n"
-            "- Item: Kindle Paperwhite\n"
-            "- Purchase Date: 5 days ago (Eligible for return within 30 days)\n"
-            "- Refund Status: APPROVED\n"
-            "- Refund ID: REF-8849201\n"
-            "- Payout Timeline: 3-5 business days\n"
-        )
-    if "platinum" in query_lower or "loyalty" in query_lower or "tier" in query_lower:
-        return (
-            "Loyalty Program Tiers and Benefits:\n"
-            "- Platinum Tier Benefits: Free same-day shipping, 15% discount, priority support, and 5x points earnings.\n"
-            "- Gold Tier Benefits: Free standard shipping, 10% discount, and priority support.\n"
-            "- Silver Tier Benefits: Standard shipping rates and standard customer support.\n"
-        )
-
     if not KB_ID:
         return "Knowledge base not configured."
     try:
-        response = _bedrock_runtime.retrieve(
+        runtime = get_bedrock_runtime()
+        response = runtime.retrieve(
             knowledgeBaseId=KB_ID,
             retrievalQuery={"text": query}
         )
@@ -235,7 +308,7 @@ def search_knowledge_base(query: str) -> str:
     
 # ── TODO 7 — Loyalty Discount Tool (Code Interpreter) ────────────────────────
 @tool
-def calculate_loyalty_discount(
+async def calculate_loyalty_discount(
     loyalty_points: int,
     tier: str,
     order_total: float,
@@ -244,15 +317,6 @@ def calculate_loyalty_discount(
     """
     Calculate the loyalty discount for a customer order using the
     AgentCore Code Interpreter. Runs exact arithmetic in a secure sandbox.
-
-    Args:
-        loyalty_points:   Customer's current points balance
-        tier:             Customer tier — Silver, Gold, or Platinum
-        order_total:      Order total in USD
-        product_category: standard, device, or fresh
-
-    Returns:
-        Full discount breakdown and final price
     """
     code = f"""
 earn_rates = {{"standard": 1, "device": 2, "fresh": 5}}
@@ -285,6 +349,7 @@ print(json.dumps({{
     "discount_from_points": discount_from_points,
     "subtotal_after_points": subtotal_after_points,
     "tier_discount": tier_discount,
+    "tier_discount_pct": tier_rate,
     "final_total": final_total,
     "total_savings": total_savings,
     "points_earned": points_earned,
@@ -293,9 +358,8 @@ print(json.dumps({{
 """
 
     try:
-        # Use code_session as a context manager correctly
-        with code_session(REGION) as session:
-            response = session.invoke(
+        async with code_session(REGION) as session:
+            response = await session.invoke(
                 "executeCode",
                 language="python",
                 code=code,
@@ -313,14 +377,14 @@ print(json.dumps({{
     except Exception as e:
         logger.warning(f"Code interpreter session failed, using math fallback: {e}")
 
-    # Fallback arithmetic calculation if sandbox fails
+    # Fallback arithmetic calculation
     tier_rates = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
+    tier_rate = tier_rates.get(tier, 0.00)
     redeemable_points = (loyalty_points // 500) * 500
     max_points_allowed = int(order_total * 0.50 / 0.01)
     points_to_redeem = min(redeemable_points, max_points_allowed)
     discount_from_points = points_to_redeem * 0.01
     subtotal_after_points = max(0.0, order_total - discount_from_points)
-    tier_rate = tier_rates.get(tier, 0.00)
     tier_discount = subtotal_after_points * tier_rate
     final_total = max(0.0, subtotal_after_points - tier_discount)
     total_savings = order_total - final_total
@@ -334,127 +398,246 @@ print(json.dumps({{
         "discount_from_points": discount_from_points,
         "subtotal_after_points": subtotal_after_points,
         "tier_discount": tier_discount,
+        "tier_discount_pct": tier_rate,
         "final_total": final_total,
         "total_savings": total_savings,
         "points_earned": points_earned,
         "remaining_points": remaining_points
     })
 
-# ── Browser Tool Wrapper ──────────────────────────────────────────────────────
+
 @tool
 def browse_website(url: str) -> str:
-    """
-    Navigate to a webpage and retrieve its title and content using the browser tool.
-    
-    Args:
-        url: The web URL to visit
-    """
+    """Open a website in the AgentCore browser and return its live page title."""
+    session_name = "website-test-session"
+
+    logger.info("BROWSE_WEBSITE called with url=%s", url)
+
+    browser = AgentCoreBrowser(region=REGION)
+
     try:
-        browser_client = AgentCoreBrowser(region=REGION)
-        result = browser_client.browser(url)
-        return str(result)
-    except Exception as e:
-        url_lower = url.lower()
-        if "udacity" in url_lower:
-            return "Page Title: Udacity | Online Courses & Nanodegrees"
-        elif "amazon" in url_lower:
-            return "Page Title: Amazon.com. Spend less. Smile more."
-        return f"Page Title retrieved successfully for {url}. (Simulated headless environment title: Online Platform)"
+        init_result = browser.browser({
+            "action": {
+                "type": "init_session",
+                "description": "Retrieve a website page title",
+                "session_name": session_name,
+            }
+        })
+        logger.info("BROWSER INIT RESULT: %s", init_result)
+
+        navigate_result = browser.browser({
+            "action": {
+                "type": "navigate",
+                "url": url,
+                "session_name": session_name,
+            },
+            "wait_time": 3,
+        })
+        logger.info("BROWSER NAVIGATE RESULT: %s", navigate_result)
+
+        title_result = browser.browser({
+            "action": {
+                "type": "evaluate",
+                "session_name": session_name,
+                "script": "document.title",
+            }
+        })
+        logger.info("BROWSER TITLE RESULT: %s", title_result)
+
+        return json.dumps({
+            "url": url,
+            "page_title_result": title_result,
+        })
+
+    except Exception:
+        logger.exception("browse_website failed")
+        return "Browser tool failed to retrieve the page title."
+
+    finally:
+        try:
+            close_result = browser.browser({
+                "action": {
+                    "type": "close",
+                    "session_name": session_name,
+                }
+            })
+            logger.info("BROWSER CLOSE RESULT: %s", close_result)
+        except Exception:
+            logger.exception("Failed to close browser session")
 
 
-# ── TODO 8 — Agent Entrypoint ─────────────────────────────────────────────────
+# ── TODO 8 — Agent Entrypoint ────────────────────────────────────────────────
 @app.entrypoint
 async def invoke(payload, context=None):
     """
     Main handler called by AgentCore for every incoming request.
-
-    Expected payload keys:
-      prompt      (str, required) — the customer's message
-      customer_id (str, optional) — unique customer identifier
-      session_id  (str, optional) — session identifier; generated if absent
     """
     try:
         user_input = payload.get("prompt", "")
         actor_id = payload.get("customer_id", "DEFAULT-CUSTOMER")
         session_id = payload.get("session_id") or str(uuid.uuid4())
 
-        memory_hook = MemoryHook(actor_id, session_id, memory_client, MEMORY_ID)
-        hook_registry = HookRegistry()
-        memory_hook.register_hooks(hook_registry)
+        if not user_input.strip():
+            return json.dumps({"error": "The prompt cannot be empty."})
 
-        tools_list = [
-            search_knowledge_base,
-            calculate_loyalty_discount,
-            browse_website
-        ]
-
-        shared_system_prompt = (
-            "You are an intelligent customer support assistant for an e-commerce platform. "
-            "You handle complex, multi-step customer service workflows — order tracking, returns processing, "
-            "product recommendations, and loyalty rewards calculations. "
-            "CRITICAL: Whenever an order ID (like ORD-001 or ORD-002) is mentioned, you MUST immediately call the search_knowledge_base tool. "
-            "CRITICAL: If the user message includes a 'Customer Context:' block, you MUST use that information to directly state the customer's name (Jane) and their exact communication preference for concise responses, and strictly keep your response short and concise."
+        # Set up memory
+        mem_client = get_memory_client()
+        memory_hook = MemoryHook(
+            actor_id, session_id, mem_client, MEMORY_ID
         )
 
-        try:
-            from botocore.auth import SigV4Auth
-            from botocore.awsrequest import AWSRequest
-            import httpx
+        # System prompt
+        shared_system_prompt = (
+            "You are an intelligent customer support assistant for an "
+            "e-commerce platform. You handle order tracking, returns, "
+            "product recommendations, and loyalty rewards. "
+            "Always prioritize the customer's current message and answer "
+            "what they actually asked. Do not introduce unrelated order "
+            "details, refunds, or other historical information unless the "
+            "customer asks about them or they are directly relevant. "
+            "For greetings or introductions, acknowledge the customer and "
+            "any preferences they state, briefly and naturally. "
+            "For order tracking, order status, or specific order IDs, "
+            "you MUST use the get_order tool, which calls the MCP Gateway. "
+            "Never use the knowledge base as a substitute for looking up "
+            "an actual order. If the gateway tools are unavailable, clearly "
+            "tell the customer that order tracking is temporarily unavailable. "
+            "Use search_knowledge_base only for product specifications, "
+            "return policies, warranty information, and loyalty rules. "
+            "If a Customer Context block is provided, use relevant facts "
+            "and preferences to personalize the response, but do not treat "
+            "all retrieved memories as requests to discuss those topics."
+        )
 
-            class AWSAuth(httpx.Auth):
-                def __init__(self, credentials, region):
-                    self.credentials = credentials
-                    self.region = region
 
-                def auth_flow(self, request: httpx.Request):
-                    aws_request = AWSRequest(
-                        method=request.method,
-                        url=str(request.url),
-                        headers=dict(request.headers),
-                        body=request.content
-                    )
-                    SigV4Auth(self.credentials, "bedrock-agentcore", self.region).add_auth(aws_request)
-                    for k, v in aws_request.headers.items():
-                        request.headers[k] = v
-                    yield request
+        # Local tools
+        local_tools = [
+            search_knowledge_base,
+            calculate_loyalty_discount,
+            browse_website,
+        ]
 
-            boto_session = boto3.Session()
-            credentials = boto_session.get_credentials().get_frozen_credentials()
-            auth = AWSAuth(credentials, REGION)
+        # Connect to the AWS AgentCore Gateway using IAM SigV4
+        from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 
-            async with streamable_http_client(GATEWAY_URL, auth=auth) as (read_stream, write_stream):
-                async with MCPClient(read_stream, write_stream) as mcp:
-                    gateway_tools = await mcp.get_tools()
-                    tools_list.extend(gateway_tools)
-                    
-                    agent = Agent(
-                        model=model,
-                        tools=tools_list,
-                        system_prompt=shared_system_prompt,
-                        hooks=[memory_hook]
-                    )
-                    response = await agent.invoke_async(user_input)
-                    if hasattr(response, "text"):
-                        return response.text
-                    elif isinstance(response, list) and len(response) > 0:
-                        return response[0].get("content", str(response))
-                    return str(response)
-        except Exception as gateway_err:
-            logger.warning(f"Gateway connection failed ({gateway_err}), falling back to local tools only.")
-            agent = Agent(
-                model=model,
-                tools=[search_knowledge_base, calculate_loyalty_discount, browse_website],
-                system_prompt=shared_system_prompt,
-                hooks=[memory_hook]
+        mcp = MCPClient(
+            lambda: aws_iam_streamablehttp_client(
+                endpoint=GATEWAY_URL,
+                aws_service="bedrock-agentcore",
+                aws_region=REGION,
             )
+        )
+
+        with mcp:
+            # Retrieve tools exposed by the Gateway
+            gateway_tools = mcp.list_tools_sync()
+
+            logger.info(
+                "Original Gateway tools: %s",
+                [t.mcp_tool.name for t in gateway_tools],
+            )
+
+            # Local wrapper for order lookup.
+            @tool
+            def get_order(order_id: str) -> str:
+                """Retrieve order status and delivery details using the order ID."""
+                try:
+                    result = mcp.call_tool_sync(
+                        tool_use_id=str(uuid.uuid4()),
+                        name="order-tracker___GetOrder",
+                        arguments={"order_id": order_id},
+                    )
+
+                    if (
+                        result.get("status") != "success"
+                        or result.get("isError")
+                    ):
+                        logger.error(
+                            "Gateway order lookup failed: %s", result
+                        )
+                        return "Order lookup failed. Please try again."
+
+                    response_text = "\n".join(
+                        item.get("text", "")
+                        for item in result.get("content", [])
+                        if item.get("text")
+                    )
+
+                    if not response_text:
+                        logger.warning(
+                            "Gateway returned no order details for %s",
+                            order_id,
+                        )
+                        return "No order details were returned. Please try again."
+
+                    return response_text
+
+                except Exception:
+                    logger.exception("get_order Gateway call failed")
+                    return "Order lookup failed. Please try again."
+
+            # Rename hyphens in Gateway tool names for model compatibility
+            renamed_gateway_tools = [
+                MCPAgentTool(
+                    mcp_tool=t.mcp_tool,
+                    mcp_client=mcp,
+                    name_override=t.mcp_tool.name.replace("-", "_"),
+                    timeout=t.timeout,
+                )
+                for t in gateway_tools
+            ]
+
+            logger.info(
+                "Agent-facing tools: %s",
+                [t.tool_name for t in renamed_gateway_tools],
+            )
+
+            other_gateway_tools = [
+                t
+                for t in renamed_gateway_tools
+                if t.mcp_tool.name != "order-tracker___GetOrder"
+            ]
+
+            # Combine local tools, other Gateway tools, and get_order
+            tools_list = local_tools + other_gateway_tools + [get_order]
+
+            logger.info(
+                "Tools supplied to the agent: %s",
+                [
+                    getattr(t, "tool_name", getattr(t, "__name__", str(t)))
+                    for t in tools_list
+                ],
+            )
+
+            # Create and invoke the agent
+            agent = Agent(
+                model=get_model(),
+                tools=tools_list,
+                system_prompt=shared_system_prompt,
+                hooks=[memory_hook],
+            )
+
             response = await agent.invoke_async(user_input)
+
             if hasattr(response, "text"):
                 return response.text
+
             return str(response)
 
     except Exception as e:
-        logger.error(f"Error in agent invocation: {e}")
+        logger.exception("Agent invocation or MCP Gateway failed")
+
+        # Do not claim an order was tracked if Gateway access failed.
+        if "ORD-" in payload.get("prompt", "").upper():
+            return (
+                "I'm unable to retrieve your order status right now because "
+                "the order-tracking service is unavailable. Please try again "
+                "shortly."
+            )
+
         return json.dumps({"error": str(e)})
+
+
     
 # ── CLI entry point (do not modify) ──────────────────────────────────────────
 def main():
@@ -469,4 +652,4 @@ def main():
 if __name__ == "__main__":
     app.run()
     # Uncomment the line below and comment app.run() for local CLI testing:
-    # main()
+    main()
