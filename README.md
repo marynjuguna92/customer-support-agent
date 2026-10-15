@@ -53,17 +53,22 @@ Remaining Points: 349
 
 ## Project Reflection & Design Considerations
 
-Throughout the development of the customer_support_agent, architectural choices were guided by modularity, security, and resilience. A prime example is the implementation of the MemoryHook class extending Strands' HookProvider. Rather than hardcoding memory namespaces or relying on fragile inline retrieval calls, the hook dynamically queries strategy templates via MemoryClient.
-get_memory_strategies(). This ensures that semantic memory retrieval and conversation persistence remain decoupled from core agent logic, allowing long-term customer preferences and historical interactions to be seamlessly injected as structured Customer Context: blocks before agent evaluation.'
+This project helped me understand how to build an AI customer support agent using Amazon Bedrock AgentCore, Strands Agents, and the MCP Gateway. One of the key design decisions was using the MCP Gateway to connect the agent to customer support tools for order tracking, refunds, and returns. This allows the agent to retrieve relevant information and perform customer support tasks instead of relying only on general model knowledge.
+
+The MemoryHook was another important part of the project. It allows the agent to retrieve customer context before responding and save interactions for future conversations. This makes the agent more useful by supporting personalized responses based on previous interactions.
 
 ## Challenges & Solutions
 
-A significant technical challenge encountered during deployment was handling asynchronous memory indexing delays and resolving IAM permission blocks for cross-session recall. When testing long-term memory across distinct sessions, asynchronous background extraction in AWS Bedrock occasionally caused vector store misses during rapid manual verification. Furthermore, runtime IAM execution required explicit inline policy bindings (AgentCoreMemoryAccess) for bedrock-agentcore:GetMemory. To resolve these hurdles, we implemented a robust two-tier memory strategy featuring dynamic namespace discovery, fallback event listing, and semantic search query refinement to ensure reliable verification.
+One of the main challenges was troubleshooting MCP Gateway tool calls and resolving errors during agent invocation. Some requests failed because of tool execution and model tool-use errors. I investigated the terminal output and CloudWatch logs to identify the problems and test the agent again.
 
-## Production Considerations: Security & Scalability
+Another challenge was configuring AWS IAM permissions for the agent to access the required resources. I resolved this by running the permissions setup script and verifying that the necessary policies were added. I also worked through memory-related issues by checking the memory namespaces and testing how customer context was retrieved and saved.
 
-In a production environment, deploying autonomous customer support agents requires strict adherence to security boundaries and cost-effective scalability. For instance, executing untrusted calculations or multi-tenant customer workflows requires complete isolation. By utilizing the AgentCore Code Interpreter sandbox (code_session), exact arithmetic for loyalty points redemption and tier discounts runs in an isolated ephemeral execution environment rather than the main agent container, mitigating code-injection risks. Additionally, incorporating comprehensive exception handling and fallback arithmetic paths ensures high availability and fault tolerance, preventing downstream service interruptions if transient gateway or sandbox timeouts occur.
+During final testing, the refund policy test returned an error. I continued testing until I obtained a successful response and updated the screenshot used as test evidence. This showed the importance of checking actual outputs rather than assuming that the agent works correctly.
+
+## Production Considerations
+
+For production use, the agent needs reliable error handling, secure IAM permissions, and careful protection of customer information. For example, if the MCP Gateway is temporarily unavailable during an order-tracking request, the agent should inform the customer that the service is unavailable instead of inventing an order status. Memory access should also be restricted to the appropriate customer to prevent information from being exposed across accounts.
 
 ## Conclusion
 
-The Customer Support AI Agent successfully demonstrates the power of combining Amazon Bedrock AgentCore, the Strands framework, and Model Context Protocol (MCP) tool integration. By implementing robust cross-session memory hooks, secure sandboxed code execution for loyalty calculations, and automated browser tools, this architecture delivers a reliable, production-ready enterprise agent. Every test scenario—from multi-session memory recall to live web page title extraction has been rigorously verified, ensuring a scalable and secure foundation for autonomous AI support systems.
+This project gave me practical experience in building, deploying, and troubleshooting an AI agent that integrates multiple AWS services. I learned that successful agent development involves more than writing code; it also requires configuring permissions, testing integrations, managing memory, and verifying results. Overcoming these challenges helped me better understand how to build a reliable, secure, and useful customer support agent.
